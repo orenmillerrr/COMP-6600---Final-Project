@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Step 1: Define the TDNN model
+class TDNNCorrector(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=128):
+        super(TDNNCorrector, self).__init__()
+        self.tdnn1 = nn.Conv1d(in_channels=input_dim, out_channels=hidden_dim, kernel_size=5, padding=2)
+        self.relu1 = nn.ReLU()
+        self.tdnn2 = nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, padding=1)
+        self.relu2 = nn.ReLU()
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.relu1(self.tdnn1(x))
+        x = self.relu2(self.tdnn2(x))
+        x = x.permute(0, 2, 1)
+        output = self.fc(x)
+        return output
+
+# Step 2: Prepare example data
+sequence_length = 50
+input_dim = 3
+output_dim = 3
+batch_size = 32
+total_samples = 2000
+
+# Create synthetic data and labels
+
+true_positions = torch.sin(torch.linspace(0, 10, total_samples).unsqueeze(1).unsqueeze(2) * 5).repeat(1, sequence_length, input_dim)
+noisy_positions = torch.randn(total_samples, sequence_length, input_dim) + true_positions
+labels = true_positions - noisy_positions
+
+# Split data into training, validation, and test sets
+train_split = 0.7
+val_split = 0.15
+test_split = 0.15
+
+train_size = int(train_split * total_samples)
+val_size = int(val_split * total_samples)
+test_size = total_samples - train_size - val_size
+
+train_noisy_data = noisy_positions[:train_size]
+train_labels = labels[:train_size]
+val_noisy_data = noisy_positions[train_size:train_size+val_size]
+val_labels = labels[train_size:train_size+val_size]
+test_noisy_data = noisy_positions[train_size+val_size:]
+test_labels = labels[train_size+val_size:]
+test_true_data = true_positions[train_size+val_size:]
+
+# Create datasets and dataloaders
+train_dataset = TensorDataset(train_noisy_data, train_labels)
+val_dataset = TensorDataset(val_noisy_data, val_labels)
+test_dataset = TensorDataset(test_noisy_data, test_labels)
+
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+
+# Step 3: Train the model and track loss
+def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001):
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    train_losses = []
+    val_losses = []
+
+    print("Starting training...")
+    for epoch in range(epochs):
+        # Training loop
+        model.train()
+        running_loss = 0.0
+        for data, target in train_loader:
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        train_losses.append(running_loss / len(train_loader))
+
+        # Validation loop
+        model.eval()
+        running_loss = 0.0
+        with torch.no_grad():
+            for data, target in val_loader:
+                output = model(data)
+                loss = criterion(output, target)
+                running_loss += loss.item()
+        val_losses.append(running_loss / len(val_loader))
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_losses[-1]:.4f}, Validation Loss: {val_losses[-1]:.4f}")
+    
+    print("Training finished!")
+    return model, train_losses, val_losses
+
+# Instantiate and train the model
+model = TDNNCorrector(input_dim, output_dim)
+trained_model, train_losses, val_losses = train_model(model, train_dataloader, val_dataloader)
+
+# Step 4: Plot the loss
+plt.figure(figsize=(10, 6))
+plt.plot(train_losses, label='Training Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.title('Training and Validation Loss Over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss (MSE)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Step 5: (Optional) Make predictions and plot corrected positions (same as previous script)
+trained_model.eval()
+with torch.no_grad():
+    predicted_errors = trained_model(test_noisy_data)
+    corrected_positions = test_noisy_data + predicted_errors
+
+test_noisy_np = test_noisy_data.numpy()
+test_true_np = test_true_data.numpy()
+corrected_np = corrected_positions.numpy()
+
+test_noisy_flat = test_noisy_np.reshape(-1, 3)
+test_true_flat = test_true_np.reshape(-1, 3)
+corrected_flat = corrected_np.reshape(-1, 3)
+
+fig, axes = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
+fig.suptitle('TDNN Correction of Position Coordinates Over Time', fontsize=16)
+time_steps = range(test_noisy_flat.shape[0])
+
+axes[0].plot(time_steps, test_noisy_flat[:, 0], label='Noisy X-Position', alpha=0.5, color='orange')
+axes[0].plot(time_steps, test_true_flat[:, 0], label='True X-Position', alpha=0.5, color='blue')
+axes[0].plot(time_steps, corrected_flat[:, 0], label='TDNN Corrected X-Position', color='green')
+axes[0].set_ylabel('X Coordinate')
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(time_steps, test_noisy_flat[:, 1], label='Noisy Y-Position', alpha=0.5, color='orange')
+axes[1].plot(time_steps, test_true_flat[:, 1], label='True Y-Position', alpha=0.5, color='blue')
+axes[1].plot(time_steps, corrected_flat[:, 1], label='TDNN Corrected Y-Position', color='green')
+axes[1].set_ylabel('Y Coordinate')
+axes[1].legend()
+axes[1].grid(True)
+
+axes[2].plot(time_steps, test_noisy_flat[:, 2], label='Noisy Z-Position', alpha=0.5, color='orange')
+axes[2].plot(time_steps, test_true_flat[:, 2], label='True Z-Position', alpha=0.5, color='blue')
+axes[2].plot(time_steps, corrected_flat[:, 2], label='TDNN Corrected Z-Position', color='green')
+axes[2].set_xlabel('Time Step')
+axes[2].set_ylabel('Z Coordinate')
+axes[2].legend()
+axes[2].grid(True)
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
