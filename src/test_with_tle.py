@@ -13,6 +13,7 @@ import os
 from astropy.coordinates import EarthLocation, TEME, ITRS
 from astropy.time import Time
 import astropy.units as u
+from sklearn.preprocessing import StandardScaler
 
 # =========================================
 # Step 1: Define the TDNN correction model
@@ -97,21 +98,41 @@ def load_sp3(filepath):
 def propagate_tle(filepath, time_list):
     lines = open(filepath).read().strip().splitlines()
     tle_pairs = [(lines[i], lines[i + 1]) for i in range(0, len(lines), 2)]
-    all_positions = []
 
-    for line1, line2 in tle_pairs:
+    # Extract TLE epochs (Julian days)
+    tle_epochs = []
+    for line1, _ in tle_pairs:
+        year = int(line1[18:20])
+        year += 2000 if year < 57 else 1900
+        day_of_year = float(line1[20:32])
+        epoch_date = datetime(year, 1, 1) + pd.to_timedelta(day_of_year - 1, unit='D')
+        tle_epochs.append(epoch_date)
+
+    df_list = []
+
+    for i, (line1, line2) in enumerate(tle_pairs):
         sat = Satrec.twoline2rv(line1, line2)
+        start_time = tle_epochs[i]
+        end_time = tle_epochs[i + 1] if i + 1 < len(tle_epochs) else time_list[-1]
+
+        # Select only times within this TLE’s validity window
+        valid_times = [t for t in time_list if start_time <= t < end_time]
+        if not valid_times:
+            continue
+
         pos = []
-        for t in time_list:
+        for t in valid_times:
             jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
             e, r, v = sat.sgp4(jd, fr)
             pos.append(r if e == 0 else [np.nan, np.nan, np.nan])
-        all_positions.append(pos)
 
-    mean_positions = np.nanmean(np.array(all_positions), axis=0)
-    df = pd.DataFrame(mean_positions, columns=["x_sgp4", "y_sgp4", "z_sgp4"])
-    df["time"] = time_list
+        df_temp = pd.DataFrame(pos, columns=["x_sgp4", "y_sgp4", "z_sgp4"])
+        df_temp["time"] = valid_times
+        df_list.append(df_temp)
+
+    df = pd.concat(df_list, ignore_index=True)
     return df
+
 
 def compute_errors(sp3_df, sgp4_df):
     merged = pd.concat([sp3_df.reset_index(drop=True), sgp4_df[['x_sgp4', 'y_sgp4', 'z_sgp4']]], axis=1)
@@ -187,10 +208,11 @@ for sp3_file, tle_file in zip(sp3_files, tle_files):
         if tle_epochs:
             tle_start = tle_epochs[0]
             tle_end = tle_epochs[-1]
-            import datetime
-            tle_start_dt = datetime.datetime(tle_start[0], 1, 1) + datetime.timedelta(days=tle_start[1] - 1)
-            tle_end_dt = datetime.datetime(tle_end[0], 1, 1) + datetime.timedelta(days=tle_end[1] - 1)
+            from datetime import datetime, timedelta
+            tle_start_dt = datetime(tle_start[0], 1, 1) + timedelta(days=tle_start[1] - 1)
+            tle_end_dt   = datetime(tle_end[0], 1, 1) + timedelta(days=tle_end[1] - 1)
             print(f"     TLE First Epoch : {tle_start_dt.strftime('%Y-%m-%d %H:%M:%S')}  →  Last Epoch : {tle_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
         else:
             print("     ⚠️ No valid TLE epochs found!")
         sgp4_df = propagate_tle(tle_file, list(sp3_df['time_sp3']))
@@ -208,7 +230,9 @@ for sp3_file, tle_file in zip(sp3_files, tle_files):
         # plt.legend()
         # plt.grid(True)
         # plt.tight_layout()
-        # plt.show()
+        # plt.show(block=False)
+        # plt.pause(2)
+
 
         # plt.figure(figsize=(10, 6))
         # plt.plot(sp3_df["time_sp3"], sp3_df["y_truth"], label="SP3 Y (truth)", color="blue")
@@ -219,7 +243,9 @@ for sp3_file, tle_file in zip(sp3_files, tle_files):
         # plt.legend()
         # plt.grid(True)
         # plt.tight_layout()
-        # plt.show()
+        # plt.show(block=False)
+        # plt.pause(2)
+
 
         # plt.figure(figsize=(10, 6))
         # plt.plot(sp3_df["time_sp3"], sp3_df["z_truth"], label="SP3 Z (truth)", color="blue")
@@ -230,7 +256,9 @@ for sp3_file, tle_file in zip(sp3_files, tle_files):
         # plt.legend()
         # plt.grid(True)
         # plt.tight_layout()
-        # plt.show()
+        # plt.show(block=False)
+        # plt.pause(2)
+
 
         # Optional: plot total position error magnitude
         plt.figure(figsize=(10, 4))
@@ -240,7 +268,10 @@ for sp3_file, tle_file in zip(sp3_files, tle_files):
         plt.ylabel("3D Error Magnitude (km)")
         plt.grid(True)
         plt.tight_layout()
-        plt.show()
+        plt.show(block=False)
+        plt.pause(2)
+
+
 
     except Exception as e:
         print(f"❌ Error processing {sp3_file} / {tle_file}: {e}")
@@ -268,6 +299,25 @@ for i in range(len(data) - sequence_length):
 X = torch.tensor(np.array(X), dtype=torch.float32)
 y = torch.tensor(np.array(y), dtype=torch.float32)
 
+# # =========================================
+# # Normalize inputs (SGP4 positions) and targets (errors)
+# # =========================================
+# X_reshaped = X.reshape(-1, 3)
+# y_reshaped = y.reshape(-1, 3)
+
+# scaler_X = StandardScaler()
+# scaler_y = StandardScaler()
+
+# # Fit scalers only on training data to prevent data leakage later
+# scaler_X.fit(X_reshaped)
+# scaler_y.fit(y_reshaped)
+
+# # Apply transforms
+# X_norm = torch.tensor(scaler_X.transform(X_reshaped).reshape(X.shape), dtype=torch.float32)
+# y_norm = torch.tensor(scaler_y.transform(y_reshaped).reshape(y.shape), dtype=torch.float32)
+
+# X, y = X_norm, y_norm
+
 # Split into train/val/test
 train_split = 0.7
 val_split = 0.15
@@ -291,7 +341,7 @@ test_dataloader = DataLoader(test_dataset, batch_size=32)
 # =========================================
 # Step 4: Train the model
 # =========================================
-def train_model(model, train_loader, val_loader, epochs=500, lr=0.001):
+def train_model(model, train_loader, val_loader, epochs=250, lr=0.001):
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     train_losses, val_losses = [], []
@@ -334,7 +384,9 @@ plt.ylabel('MSE Loss')
 plt.title('TDNN Training with Real SP3/TLE Data')
 plt.legend()
 plt.grid(True)
-plt.show()
+plt.show(block=False)
+plt.pause(2)
+
 
 # =========================================
 # Step 6: Evaluate on test data
@@ -342,7 +394,13 @@ plt.show()
 trained_model.eval()
 with torch.no_grad():
     predicted_errors = trained_model(test_X)
+    # # Inverse transform the predicted errors back to physical units (km)
+    # predicted_errors = torch.tensor(
+    #     scaler_y.inverse_transform(predicted_errors_norm.numpy()),
+    #     dtype=torch.float32
+    # )
     corrected_positions = test_X[:, -1, :] + predicted_errors
+
 
 # Compute true and uncorrected (SGP4) positions
 true_positions = (test_X[:, -1, :] + test_y)
@@ -363,7 +421,9 @@ plt.xlabel('Sample Index')
 plt.ylabel('X Position (km)')
 plt.legend()
 plt.grid(True)
-plt.show()
+plt.show(block=False)
+plt.pause(2)
+
 
 
 print("✅ Training complete and orbit correction results plotted.")
@@ -391,6 +451,7 @@ plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
+
 
 # --- 2. Print summary statistics ---
 import numpy as np
