@@ -1,3 +1,20 @@
+"""
+test_with_tle.py — Unified Propagation + TDNN Correction Pipeline
+------------------------------------------------------------------
+Integrates:
+✅ SP3/TLE propagation (from prop_verification.py)
+✅ Orbit component plots (X, Y, Z) with epoch markers
+✅ TDNN model for SGP4 orbit error correction
+
+Workflow:
+1. Load SP3 truth data (ECEF → TEME)
+2. Propagate SGP4 orbits using TLE segments
+3. Plot X/Y/Z coordinate comparisons and 3D error over time
+4. Compute propagation errors (SGP4–SP3)
+5. Train a TDNN to model and correct these errors
+6. Compare SGP4 vs TDNN-corrected performance
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,19 +22,16 @@ from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import georinex as grx
 from sgp4.api import Satrec, jday
-import glob
-from datetime import datetime
-import os
-from astropy.coordinates import EarthLocation, TEME, ITRS
+from datetime import datetime, timedelta
+from astropy.coordinates import ITRS, TEME
 from astropy.time import Time
 import astropy.units as u
-from sklearn.preprocessing import StandardScaler
+import glob, os
 
-# =========================================
-# Step 1: Define the TDNN correction model
-# =========================================
+# ==============================================================
+# 1. TDNN Correction Model
+# ==============================================================
 class TDNNCorrector(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=128):
         super(TDNNCorrector, self).__init__()
@@ -32,131 +46,97 @@ class TDNNCorrector(nn.Module):
         x = self.relu1(self.tdnn1(x))
         x = self.relu2(self.tdnn2(x))
         x = x.permute(0, 2, 1)
-        output = self.fc(x)
-        # Only keep last time step prediction
-        return output[:, -1, :]
+        return self.fc(x)[:, -1, :]
 
 
-# =========================================
-# Step 2: Load and preprocess the real data
-# =========================================
-
+# ==============================================================
+# 2. Orbit Propagation and Error Computation
+# ==============================================================
 def load_sp3(filepath):
-    """
-    Custom SP3 reader for JCET/ILRS-style files (handles PLxx / VLxx entries).
-    Extracts position (X,Y,Z) in km for each epoch line (* ...).
-    """
-    from datetime import datetime
-
+    """Read JCET/ILRS-style SP3 file and extract position (X,Y,Z) in km."""
     times, xs, ys, zs = [], [], [], []
     current_time = None
-
     with open(filepath, "r") as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-
-            # Epoch line: starts with '*  YYYY MM DD hh mm ss'
             if line.startswith("*"):
                 parts = line.split()
-                try:
-                    year, month, day, hour, minute = map(int, parts[1:6])
-                    sec = float(parts[6])
-                    current_time = datetime(year, month, day, hour, minute, int(sec))
-                except Exception:
-                    current_time = None
-
-            # Position line: starts with 'P' or 'PL'
+                year, month, day, hour, minute = map(int, parts[1:6])
+                sec = float(parts[6])
+                current_time = datetime(year, month, day, hour, minute, int(sec))
             elif line.startswith("P") and current_time is not None:
+                vals = line.split()
                 try:
-                    # Some lines have an ID like PL51 or P 51
-                    values = line.split()
-                    # Last three numeric values are X, Y, Z in meters
-                    nums = [float(v) for v in values[-3:]]
-                    xs.append(nums[0])
-                    ys.append(nums[1])
-                    zs.append(nums[2])
+                    x, y, z = map(float, vals[-3:])
+                    xs.append(x)
+                    ys.append(y)
+                    zs.append(z)
                     times.append(current_time)
                 except Exception:
                     continue
-            # Skip velocity lines (VLxx)
-            else:
-                continue
+    return pd.DataFrame({"time_sp3": times, "x_truth": xs, "y_truth": ys, "z_truth": zs})
 
-    if not times:
-        raise ValueError(f"No position records found in {filepath}")
 
-    df = pd.DataFrame({
-        "time_sp3": times,
-        "x_truth": xs,
-        "y_truth": ys,
-        "z_truth": zs
-    })
-    return df
+def ecef_to_teme(sp3_df):
+    """Convert SP3 coordinates from ECEF/ITRF to TEME frame."""
+    times = Time(sp3_df["time_sp3"].values, scale="utc")
+    itrs = ITRS(x=sp3_df["x_truth"].values * u.km,
+                y=sp3_df["y_truth"].values * u.km,
+                z=sp3_df["z_truth"].values * u.km,
+                obstime=times)
+    teme = itrs.transform_to(TEME(obstime=times))
+    sp3_df["x_truth"] = teme.x.to(u.km).value
+    sp3_df["y_truth"] = teme.y.to(u.km).value
+    sp3_df["z_truth"] = teme.z.to(u.km).value
+    return sp3_df
+
 
 def propagate_tle(filepath, time_list):
+    """Propagate a sequence of TLE segments across their epoch windows."""
     lines = open(filepath).read().strip().splitlines()
     tle_pairs = [(lines[i], lines[i + 1]) for i in range(0, len(lines), 2)]
 
-    # Extract TLE epochs (Julian days)
     tle_epochs = []
     for line1, _ in tle_pairs:
         year = int(line1[18:20])
         year += 2000 if year < 57 else 1900
         day_of_year = float(line1[20:32])
-        epoch_date = datetime(year, 1, 1) + pd.to_timedelta(day_of_year - 1, unit='D')
-        tle_epochs.append(epoch_date)
+        tle_epochs.append(datetime(year, 1, 1) + timedelta(days=day_of_year - 1))
 
     df_list = []
-
     for i, (line1, line2) in enumerate(tle_pairs):
         sat = Satrec.twoline2rv(line1, line2)
         start_time = tle_epochs[i]
         end_time = tle_epochs[i + 1] if i + 1 < len(tle_epochs) else time_list[-1]
-
-        # Select only times within this TLE’s validity window
         valid_times = [t for t in time_list if start_time <= t < end_time]
         if not valid_times:
             continue
-
         pos = []
         for t in valid_times:
             jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
             e, r, v = sat.sgp4(jd, fr)
             pos.append(r if e == 0 else [np.nan, np.nan, np.nan])
-
         df_temp = pd.DataFrame(pos, columns=["x_sgp4", "y_sgp4", "z_sgp4"])
         df_temp["time"] = valid_times
         df_list.append(df_temp)
 
     df = pd.concat(df_list, ignore_index=True)
-    return df
+    df = df.drop_duplicates(subset=["time"]).sort_values(by="time").reset_index(drop=True)
+    return df, tle_epochs
 
 
 def compute_errors(sp3_df, sgp4_df):
-    merged = pd.concat([sp3_df.reset_index(drop=True), sgp4_df[['x_sgp4', 'y_sgp4', 'z_sgp4']]], axis=1)
-    merged['dx'] = merged['x_truth'] - merged['x_sgp4']
-    merged['dy'] = merged['y_truth'] - merged['y_sgp4']
-    merged['dz'] = merged['z_truth'] - merged['z_sgp4']
-    merged['error_norm_km'] = np.sqrt(merged['dx']**2 + merged['dy']**2 + merged['dz']**2)
+    """Compute SGP4 vs SP3 positional errors."""
+    merged = pd.merge(sp3_df, sgp4_df, left_on="time_sp3", right_on="time", how="inner")
+    merged["dx"] = merged["x_truth"] - merged["x_sgp4"]
+    merged["dy"] = merged["y_truth"] - merged["y_sgp4"]
+    merged["dz"] = merged["z_truth"] - merged["z_sgp4"]
+    merged["error_norm_km"] = np.sqrt(merged["dx"]**2 + merged["dy"]**2 + merged["dz"]**2)
     return merged
 
-def ecef_to_teme(sp3_df):
-    """Convert SP3 positions (ECEF/ITRF) to TEME frame for comparison with SGP4."""
-    itrs = ITRS(x=sp3_df["x_truth"].values * u.km,
-                y=sp3_df["y_truth"].values * u.km,
-                z=sp3_df["z_truth"].values * u.km,
-                obstime=Time(sp3_df["time_sp3"].values))
-    teme = itrs.transform_to(TEME(obstime=Time(sp3_df["time_sp3"].values)))
-    sp3_df["x_truth"], sp3_df["y_truth"], sp3_df["z_truth"] = (
-        teme.x.to(u.km).value,
-        teme.y.to(u.km).value,
-        teme.z.to(u.km).value
-    )
-    return sp3_df
 
-# Load and merge all available SP3/TLE pairs
+# ==============================================================
+# 3. Load SP3/TLE Data, Propagate, and Plot
+# ==============================================================
 sp3_files = sorted(glob.glob("../Data/Lag1_*.sp3"))
 tle_files = sorted(glob.glob("../Data/Lag1TLE_*.txt"))
 
@@ -164,127 +144,60 @@ print("\n=== Checking for SP3 and TLE files ===")
 print("SP3 files found:", sp3_files)
 print("TLE files found:", tle_files)
 
-datasets = []
 if not sp3_files or not tle_files:
-    print("❌ No matching files found. Check your 'Data/' folder path and filenames.")
-    print("Expected names like: Data/Lag1_30225.sp3 and Data/Lag1TLE_30225.txt")
-    exit()
+    raise RuntimeError("❌ No matching SP3/TLE files found in ../Data/")
 
-print("\nProcessing SP3/TLE pairs...")
+datasets = []
 for sp3_file, tle_file in zip(sp3_files, tle_files):
-    print(f"  → {os.path.basename(sp3_file)} with {os.path.basename(tle_file)}")
+    print(f"\n→ Processing {os.path.basename(sp3_file)} with {os.path.basename(tle_file)}")
+    sp3_df = ecef_to_teme(load_sp3(sp3_file))
+    sgp4_df, tle_epochs = propagate_tle(tle_file, list(sp3_df["time_sp3"]))
+    merged = compute_errors(sp3_df, sgp4_df)
+    print(f"Merged samples: {len(merged)} (SP3: {len(sp3_df)}, SGP4: {len(sgp4_df)})")
+    print(merged[['dx','dy','dz']].describe())
 
-    try:
-        sp3_df = load_sp3(sp3_file)
-        sp3_df = ecef_to_teme(sp3_df)
-        # print(sp3_df.head(10))
-        # print("X range:", sp3_df['x_truth'].min(), "→", sp3_df['x_truth'].max())
-        # print("Y range:", sp3_df['y_truth'].min(), "→", sp3_df['y_truth'].max())
-        # print("Z range:", sp3_df['z_truth'].min(), "→", sp3_df['z_truth'].max())
+    datasets.append(merged)
 
-        if sp3_df.empty:
-            print(f"⚠️ Skipping {sp3_file}, no data read.")
-            continue
+    # --- X/Y/Z Component Plots ---
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    coords = ["x", "y", "z"]
+    for i, ax in enumerate(axes):
+        c = coords[i]
+        ax.plot(sp3_df["time_sp3"], sp3_df[f"{c}_truth"], label=f"SP3 {c.upper()}", color="blue")
+        ax.plot(sgp4_df["time"], sgp4_df[f"{c}_sgp4"], label=f"SGP4 {c.upper()}", color="orange", linestyle="--")
+        for epoch in tle_epochs:
+            if sp3_df["time_sp3"].iloc[0] <= epoch <= sp3_df["time_sp3"].iloc[-1]:
+                ax.axvline(epoch, color="gray", linestyle=":", alpha=0.7)
+        ax.set_ylabel(f"{c.upper()} (km)")
+        ax.legend()
+        ax.grid(True)
+    axes[-1].set_xlabel("Time (UTC)")
+    plt.suptitle(f"SP3 vs SGP4 Orbit Components — {os.path.basename(sp3_file)}")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show(block=False)
+    plt.pause(2)
 
-        # --- Extract SP3 start date/time ---
-        sp3_start = sp3_df['time_sp3'].iloc[0]
-        sp3_end = sp3_df['time_sp3'].iloc[-1]
-        print(f"     SP3 Start Time : {sp3_start}  →  End Time : {sp3_end}")
-
-        # --- Read TLE and extract its first epoch time ---
-        with open(tle_file, 'r') as f:
-            lines = f.readlines()
-        tle_epochs = []
-        for line in lines:
-            if line.startswith('1 '):
-                try:
-                    year_str = line[18:20]
-                    year = int(year_str)
-                    year += 2000 if year < 57 else 1900
-                    day_of_year = float(line[20:32])
-                    tle_epochs.append((year, day_of_year))
-                except Exception:
-                    pass
-        if tle_epochs:
-            tle_start = tle_epochs[0]
-            tle_end = tle_epochs[-1]
-            from datetime import datetime, timedelta
-            tle_start_dt = datetime(tle_start[0], 1, 1) + timedelta(days=tle_start[1] - 1)
-            tle_end_dt   = datetime(tle_end[0], 1, 1) + timedelta(days=tle_end[1] - 1)
-            print(f"     TLE First Epoch : {tle_start_dt.strftime('%Y-%m-%d %H:%M:%S')}  →  Last Epoch : {tle_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-
-        else:
-            print("     ⚠️ No valid TLE epochs found!")
-        sgp4_df = propagate_tle(tle_file, list(sp3_df['time_sp3']))
-        merged = compute_errors(sp3_df, sgp4_df)
-        datasets.append(merged)
-        print(f"✅ Successfully processed {os.path.basename(sp3_file)}")
-
-                # --- Plot comparison between SGP4 and SP3 for this dataset ---
-        # plt.figure(figsize=(10, 6))
-        # plt.plot(sp3_df["time_sp3"], sp3_df["x_truth"], label="SP3 X (truth)", color="blue")
-        # plt.plot(sgp4_df["time"], sgp4_df["x_sgp4"], label="SGP4 X (pred)", color="orange", linestyle="--")
-        # plt.title(f"SGP4 vs SP3 X-Coordinate — {os.path.basename(sp3_file)}")
-        # plt.xlabel("Time (UTC)")
-        # plt.ylabel("X Position (km)")
-        # plt.legend()
-        # plt.grid(True)
-        # plt.tight_layout()
-        # plt.show(block=False)
-        # plt.pause(2)
-
-
-        # plt.figure(figsize=(10, 6))
-        # plt.plot(sp3_df["time_sp3"], sp3_df["y_truth"], label="SP3 Y (truth)", color="blue")
-        # plt.plot(sgp4_df["time"], sgp4_df["y_sgp4"], label="SGP4 Y (pred)", color="orange", linestyle="--")
-        # plt.title(f"SGP4 vs SP3 Y-Coordinate — {os.path.basename(sp3_file)}")
-        # plt.xlabel("Time (UTC)")
-        # plt.ylabel("Y Position (km)")
-        # plt.legend()
-        # plt.grid(True)
-        # plt.tight_layout()
-        # plt.show(block=False)
-        # plt.pause(2)
-
-
-        # plt.figure(figsize=(10, 6))
-        # plt.plot(sp3_df["time_sp3"], sp3_df["z_truth"], label="SP3 Z (truth)", color="blue")
-        # plt.plot(sgp4_df["time"], sgp4_df["z_sgp4"], label="SGP4 Z (pred)", color="orange", linestyle="--")
-        # plt.title(f"SGP4 vs SP3 Z-Coordinate — {os.path.basename(sp3_file)}")
-        # plt.xlabel("Time (UTC)")
-        # plt.ylabel("Z Position (km)")
-        # plt.legend()
-        # plt.grid(True)
-        # plt.tight_layout()
-        # plt.show(block=False)
-        # plt.pause(2)
-
-
-        # Optional: plot total position error magnitude
-        plt.figure(figsize=(10, 4))
-        plt.plot(merged["time_sp3"], merged["error_norm_km"], color="red")
-        plt.title(f"SGP4–SP3 Position Error — {os.path.basename(sp3_file)}")
-        plt.xlabel("Time (UTC)")
-        plt.ylabel("3D Error Magnitude (km)")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show(block=False)
-        plt.pause(2)
-
-
-
-    except Exception as e:
-        print(f"❌ Error processing {sp3_file} / {tle_file}: {e}")
-
-if not datasets:
-    raise RuntimeError("❌ No datasets were processed successfully. Check file contents or formats.")
+    # --- 3D Error Plot ---
+    plt.figure(figsize=(10, 4))
+    plt.plot(merged["time_sp3"], merged["error_norm_km"], color="red")
+    for epoch in tle_epochs:
+        if merged["time_sp3"].iloc[0] <= epoch <= merged["time_sp3"].iloc[-1]:
+            plt.axvline(epoch, color="gray", linestyle=":", alpha=0.7)
+    plt.title(f"SGP4–SP3 3D Error — {os.path.basename(sp3_file)}")
+    plt.xlabel("Time (UTC)")
+    plt.ylabel("3D Error (km)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(2)
 
 data = pd.concat(datasets, ignore_index=True)
-print("✅ Combined all datasets successfully.")
+print(f"✅ Combined all datasets — Total samples: {len(data)}")
 
-# =========================================
-# Step 3: Prepare sequences for TDNN input
-# =========================================
+
+# ==============================================================
+# 4. TDNN Training & Evaluation
+# ==============================================================
 sequence_length = 10
 input_dim = 3
 output_dim = 3
@@ -299,165 +212,66 @@ for i in range(len(data) - sequence_length):
 X = torch.tensor(np.array(X), dtype=torch.float32)
 y = torch.tensor(np.array(y), dtype=torch.float32)
 
-# # =========================================
-# # Normalize inputs (SGP4 positions) and targets (errors)
-# # =========================================
-# X_reshaped = X.reshape(-1, 3)
-# y_reshaped = y.reshape(-1, 3)
+train_split, val_split = 0.7, 0.15
+train_end = int(train_split * len(X))
+val_end = int((train_split + val_split) * len(X))
 
-# scaler_X = StandardScaler()
-# scaler_y = StandardScaler()
+train_loader = DataLoader(TensorDataset(X[:train_end], y[:train_end]), batch_size=32, shuffle=True)
+val_loader = DataLoader(TensorDataset(X[train_end:val_end], y[train_end:val_end]), batch_size=32)
+test_X, test_y = X[val_end:], y[val_end:]
 
-# # Fit scalers only on training data to prevent data leakage later
-# scaler_X.fit(X_reshaped)
-# scaler_y.fit(y_reshaped)
-
-# # Apply transforms
-# X_norm = torch.tensor(scaler_X.transform(X_reshaped).reshape(X.shape), dtype=torch.float32)
-# y_norm = torch.tensor(scaler_y.transform(y_reshaped).reshape(y.shape), dtype=torch.float32)
-
-# X, y = X_norm, y_norm
-
-# Split into train/val/test
-train_split = 0.7
-val_split = 0.15
-test_split = 0.15
-total_samples = len(X)
-
-train_end = int(train_split * total_samples)
-val_end = int((train_split + val_split) * total_samples)
-
-train_X, val_X, test_X = X[:train_end], X[train_end:val_end], X[val_end:]
-train_y, val_y, test_y = y[:train_end], y[train_end:val_end], y[val_end:]
-
-train_dataset = TensorDataset(train_X, train_y)
-val_dataset = TensorDataset(val_X, val_y)
-test_dataset = TensorDataset(test_X, test_y)
-
-train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=32)
-test_dataloader = DataLoader(test_dataset, batch_size=32)
-
-# =========================================
-# Step 4: Train the model
-# =========================================
-def train_model(model, train_loader, val_loader, epochs=250, lr=0.001):
+def train_model(model, train_loader, val_loader, epochs=50, lr=0.001):
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     train_losses, val_losses = [], []
-
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
-        for data, target in train_loader:
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        train_losses.append(running_loss / len(train_loader))
-
+        train_loss = sum(criterion(model(xb), yb).item() for xb, yb in train_loader) / len(train_loader)
         model.eval()
-        running_loss = 0.0
-        with torch.no_grad():
-            for data, target in val_loader:
-                output = model(data)
-                loss = criterion(output, target)
-                running_loss += loss.item()
-        val_losses.append(running_loss / len(val_loader))
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss={train_losses[-1]:.5f}, Val Loss={val_losses[-1]:.5f}")
-
+        val_loss = sum(criterion(model(xb), yb).item() for xb, yb in val_loader) / len(val_loader)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        print(f"Epoch {epoch+1}/{epochs}: Train={train_loss:.6f}, Val={val_loss:.6f}")
     return model, train_losses, val_losses
 
 model = TDNNCorrector(input_dim, output_dim)
-trained_model, train_losses, val_losses = train_model(model, train_dataloader, val_dataloader)
+trained_model, train_losses, val_losses = train_model(model, train_loader, val_loader)
 
-# =========================================
-# Step 5: Plot training and validation loss
-# =========================================
-plt.figure(figsize=(10, 6))
-plt.plot(train_losses, label='Training Loss')
-plt.plot(val_losses, label='Validation Loss')
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Val Loss')
 plt.xlabel('Epoch')
-plt.ylabel('MSE Loss')
-plt.title('TDNN Training with Real SP3/TLE Data')
+plt.ylabel('MSE')
+plt.title('TDNN Training Loss')
 plt.legend()
 plt.grid(True)
 plt.show(block=False)
 plt.pause(2)
 
-
-# =========================================
-# Step 6: Evaluate on test data
-# =========================================
 trained_model.eval()
 with torch.no_grad():
-    predicted_errors = trained_model(test_X)
-    # # Inverse transform the predicted errors back to physical units (km)
-    # predicted_errors = torch.tensor(
-    #     scaler_y.inverse_transform(predicted_errors_norm.numpy()),
-    #     dtype=torch.float32
-    # )
-    corrected_positions = test_X[:, -1, :] + predicted_errors
+    pred_err = trained_model(test_X)
+    corrected = test_X[:, -1, :] + pred_err
+truth = test_X[:, -1, :] + test_y
+sgp4 = test_X[:, -1, :]
 
+sgp4_err = torch.norm(truth - sgp4, dim=1)
+tdnn_err = torch.norm(truth - corrected, dim=1)
 
-# Compute true and uncorrected (SGP4) positions
-true_positions = (test_X[:, -1, :] + test_y)
-sgp4_positions = test_X[:, -1, :]
-
-# Convert to numpy for plotting
-pred_np = corrected_positions.numpy()
-true_np = true_positions.numpy()
-sgp4_np = sgp4_positions.numpy()
-
-# Plot one coordinate comparison
 plt.figure(figsize=(12, 6))
-plt.plot(sgp4_np[:, 0], label='SGP4 X', color='orange', alpha=0.6)
-plt.plot(true_np[:, 0], label='True X', color='blue', alpha=0.6)
-plt.plot(pred_np[:, 0], label='TDNN Corrected X', color='green')
-plt.title('TDNN Orbit Correction (X Coordinate)')
+plt.plot(sgp4_err.numpy(), label='SGP4 Error', color='orange', alpha=0.6)
+plt.plot(tdnn_err.numpy(), label='TDNN Corrected Error', color='green')
 plt.xlabel('Sample Index')
-plt.ylabel('X Position (km)')
-plt.legend()
-plt.grid(True)
-plt.show(block=False)
-plt.pause(2)
-
-
-
-print("✅ Training complete and orbit correction results plotted.")
-
-# =============================================================
-# Step 7: Evaluate and compare TDNN vs SGP4 vs Truth accuracy
-# =============================================================
-
-# Compute 3D RMS error for each sample
-sgp4_error = torch.norm(true_positions - sgp4_positions, dim=1)     # |truth - sgp4|
-tdnn_error = torch.norm(true_positions - corrected_positions, dim=1)  # |truth - tdnn|
-
-# Convert to numpy
-sgp4_error_np = sgp4_error.numpy()
-tdnn_error_np = tdnn_error.numpy()
-
-# --- 1. Plot 3D error over time ---
-plt.figure(figsize=(12, 6))
-plt.plot(sgp4_error_np, label='SGP4 Error (km)', color='orange', alpha=0.6)
-plt.plot(tdnn_error_np, label='TDNN Corrected Error (km)', color='green')
-plt.title('3D Position Error Magnitude: SGP4 vs TDNN')
-plt.xlabel('Sample Index (time progression)')
 plt.ylabel('3D Error (km)')
+plt.title('3D Error Comparison: SGP4 vs TDNN')
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-
-# --- 2. Print summary statistics ---
-import numpy as np
-print("========== RMS Error Summary ==========")
-print(f"SGP4 Mean 3D Error  : {np.mean(sgp4_error_np):.3f} km")
-print(f"SGP4 Max 3D Error   : {np.max(sgp4_error_np):.3f} km")
-print(f"TDNN Mean 3D Error  : {np.mean(tdnn_error_np):.3f} km")
-print(f"TDNN Max 3D Error   : {np.max(tdnn_error_np):.3f} km")
+print("\n========== RMS Error Summary ==========")
+print(f"SGP4 Mean 3D Error  : {sgp4_err.mean():.3f} km")
+print(f"SGP4 Max 3D Error   : {sgp4_err.max():.3f} km")
+print(f"TDNN Mean 3D Error  : {tdnn_err.mean():.3f} km")
+print(f"TDNN Max 3D Error   : {tdnn_err.max():.3f} km")
 print("=======================================")
