@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # <<< NEW
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
@@ -11,30 +12,79 @@ import matplotlib.pyplot as plt
 # ==============================================================
 # CONFIGURATION
 # ==============================================================
-ERROR_FOLDER = "../Data/"
+
+ERROR_FOLDER = os.getcwd() + "\\data"
 WINDOW = 180
 USE_VELOCITY = True   # turn ON/OFF velocity features
 BATCH_SIZE = 128
 EPOCHS = 100
-LR = 0.001
+LR = 0.0001
 
-MODEL_PATH = "tdnn_model.pth"
-LOSS_CSV = "tdnn_loss_curves.csv"
-PRED_CSV = "tdnn_predictions.csv"
+MODEL_PATH = "tdnn_model_velocity_LR0001.pth"
+LOSS_CSV = "tdnn_loss_curves_velocity_LR0001.csv"
+PRED_CSV = "tdnn_predictions_velocity_LR0001.csv"
 
 
 # ==============================================================
-# TDNN MODEL  (MLP on flattened window)
+# TDNN MODEL  (Causal, sequence-based)
 # ==============================================================
+
 class TDNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    """
+    Causal Time-Delay Neural Network:
+      - Uses Conv1d over time
+      - Each layer only looks at current + *past* frames
+      - No future information (good for streaming / online)
+
+    Input shape:  (batch, time, feat)
+    Output shape: (batch, output_dim)
+    """
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dims=(256, 256, 256),
+                 context_sizes=(5, 3, 3),
+                 dilations=(1, 2, 3),
+                 output_dim: int = 3):  # <<< CHANGED default to 3 (x,y,z)
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+        assert len(hidden_dims) == len(context_sizes) == len(dilations)
+
+        self.tdnn_layers = nn.ModuleList()
+        self.kernel_sizes = context_sizes
+        self.dilations = dilations
+
+        in_channels = input_dim  # features per time step
+
+        for hdim, k, d in zip(hidden_dims, context_sizes, dilations):
+            conv = nn.Conv1d(
+                in_channels=in_channels,
+                out_channels=hdim,
+                kernel_size=k,
+                dilation=d,
+                padding=0  # manual left padding → causal
+            )
+            self.tdnn_layers.append(conv)
+            in_channels = hdim
+
+        self.output_layer = nn.Linear(in_channels, output_dim)
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        return self.fc2(x)
+        """
+        x: (batch, time, feat)
+        """
+        # (B, T, F) -> (B, F, T)
+        x = x.transpose(1, 2)
+
+        for conv, k, d in zip(self.tdnn_layers, self.kernel_sizes, self.dilations):
+            pad_left = (k - 1) * d
+            # F.pad pads (left, right) along the last dimension (time)
+            x = F.pad(x, (pad_left, 0))   # causal: only pad on the left
+            x = F.relu(conv(x))
+
+        # Global mean pooling over time
+        x = x.mean(dim=2)  # (B, C)
+
+        return self.output_layer(x)
 
 
 # ==============================================================
@@ -83,10 +133,6 @@ def split_by_file(datasets, files, test_fraction=0.2):
 
 # ==============================================================
 # BUILD WINDOWED DATASET
-# Uses:
-#   - residual history [err_x, err_y, err_z]
-#   - Δ residuals (differences)
-#   - SGP4 state history (pos + vel)
 # ==============================================================
 def build_windowed_dataset(datasets, window, scaler=None):
     df_all = pd.concat(datasets, ignore_index=True)
@@ -125,12 +171,10 @@ def build_windowed_dataset(datasets, window, scaler=None):
         # windowed features
         w_res  = residual[i-window:i]        # (window,3)
         w_dres = dres[i-window:i]            # (window,3)
-
-        # normalized SGP4 window
-        w_sgp4 = sgp4_norm[i-window:i]       # (window,6 or window,3)
+        w_sgp4 = sgp4_norm[i-window:i]       # (window,6 or 3)
 
         # CONCAT: residual + Δresidual + sgp4
-        w = np.concatenate([w_res, w_dres, w_sgp4], axis=1)   # (window, 3+3+6=12)
+        w = np.concatenate([w_res, w_dres, w_sgp4], axis=1)   # (window, feat_dim)
 
         X_list.append(w)
         y_list.append(residual[i])  # target is raw residual in meters
@@ -197,29 +241,36 @@ if __name__ == "__main__":
     # BUILD TRAIN+VAL
     # --------------------------
     X_all, y_all, scaler = build_windowed_dataset(train_sets, WINDOW)
+    # X_all: (N, window, feat_dim)
 
-    # flatten window for TDNN
-    X_all_flat = X_all.reshape(len(X_all), -1)
-
-    N = len(X_all_flat)
+    N = len(X_all)
     idx_val = int(0.85 * N)
 
-    X_train = X_all_flat[:idx_val]
+    X_train = X_all[:idx_val]
     y_train = y_all[:idx_val]
-    X_val   = X_all_flat[idx_val:]
+    X_val   = X_all[idx_val:]
     y_val   = y_all[idx_val:]
 
-    # torch loaders
-    train_loader = DataLoader(TensorDataset(
-        torch.tensor(X_train), torch.tensor(y_train)),
-        batch_size=BATCH_SIZE, shuffle=True)
+    # torch loaders – note: NO FLATTENING HERE  <<< CHANGED
+    train_loader = DataLoader(
+        TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
+        batch_size=BATCH_SIZE, shuffle=True
+    )
 
-    val_loader = DataLoader(TensorDataset(
-        torch.tensor(X_val), torch.tensor(y_val)),
-        batch_size=BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(
+        TensorDataset(torch.tensor(X_val), torch.tensor(y_val)),
+        batch_size=BATCH_SIZE, shuffle=False
+    )
 
-    input_dim = X_all_flat.shape[1]
-    model = TDNN(input_dim, hidden_dim=256, output_dim=3)
+    # feat_dim per time step
+    feat_dim = X_all.shape[2]   # (N, window, feat_dim)
+    model = TDNN(
+        input_dim=feat_dim,
+        hidden_dims=([256]),
+        context_sizes=([5]),
+        dilations=([1]),
+        output_dim=3
+    )
 
     # --------------------------
     # TRAIN
@@ -245,16 +296,15 @@ if __name__ == "__main__":
     # TEST SET (HELD-OUT FILES)
     # --------------------------
     X_test, y_test, _ = build_windowed_dataset(test_sets, WINDOW, scaler)
-    X_test_flat = X_test.reshape(len(X_test), -1)
+    # X_test: (N_test, window, feat_dim)
 
     model.eval()
     with torch.no_grad():
-        y_pred = model(torch.tensor(X_test_flat)).numpy()
+        y_pred = model(torch.tensor(X_test)).numpy()   # <<< CHANGED (no flatten)
 
     # ---------------------------------------
     # COMPUTE CORRECTED ORBITS (DENORMALIZED)
     # ---------------------------------------
-    # To compute corrected orbit, we need raw SGP4 truth from test files
     df_test = pd.concat(test_sets, ignore_index=True)
 
     # raw SGP4 positions
