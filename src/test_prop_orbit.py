@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # <<< NEW
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
@@ -21,73 +21,91 @@ EPOCHS = 100
 LR = 0.0001
 
 ERROR_PATH = PATH + "\\data"
-MODEL_PATH = PATH + "\\tdnn_model_velocity_LR0001.pth"
-LOSS_CSV   = PATH + "\\tdnn_loss_curves_velocity_LR0001.csv"
-PRED_CSV   = PATH + "\\tdnn_predictions_velocity_LR0001.csv"
+MODEL_PATH = PATH + "\\tdnn_model.pth"
+LOSS_CSV   = PATH + "\\tdnn_loss_curves.csv"
+PRED_CSV   = PATH + "\\tdnn_predictions.csv"
 
-SAVE_MODEL = False
-
-TEST_SAMPLES = 5000   # set to None to use all test samples
+SAVE_MODEL   = True          # set True if you want to save the trained model
+TEST_SAMPLES = 10000           # None = use all test windows, or set e.g. 5000
 
 
 # ==============================================================
-# TDNN MODEL  (Causal, sequence-based)
+# TDNN (Conv → Flatten → Dense MLP)
 # ==============================================================
 
 class TDNN(nn.Module):
     """
-    Causal Time-Delay Neural Network:
-      - Uses Conv1d over time
-      - Each layer only looks at current + *past* frames
-      - No future information (good for streaming / online)
-
-    Input shape:  (batch, time, feat)
-    Output shape: (batch, output_dim)
+    TDNN:
+      - stack of 1D convs over time (causal)
+      - flatten (time × channels)
+      - dense MLP stack
+    
+    Input:  (batch, time, feat)   -> residual, dResidual, SGP4 state
+    Output: (batch, 3)            -> residual correction (x,y,z in meters)
     """
-    def __init__(self,
-                 input_dim: int,
-                 hidden_dims=(256, 256, 256),
-                 context_sizes=(5, 3, 3),
-                 dilations=(1, 2, 3),
-                 output_dim: int = 3): 
+    def __init__(
+        self,
+        input_dim: int,          # feat_dim per time step
+        window: int,             # number of time steps in the window
+        conv_channels=(5, 5),    # out_channels for each conv layer
+        context_sizes=(5, 3),    # kernel sizes
+        dilations=(1, 2),        # dilations
+        fc_dims=(64, 64),      # hidden sizes for dense layers
+        output_dim: int = 3      # final output dim (x,y,z residual)
+    ):
         super().__init__()
 
-        assert len(hidden_dims) == len(context_sizes) == len(dilations)
+        assert len(conv_channels) == len(context_sizes) == len(dilations), \
+            "conv_channels, context_sizes, and dilations must have same length"
 
-        self.tdnn_layers = nn.ModuleList()
+        # -------- TDNN (Conv1d) stack --------
         self.kernel_sizes = context_sizes
         self.dilations = dilations
+        self.tdnn_layers = nn.ModuleList()
 
-        in_channels = input_dim  # features per time step
-
-        for hdim, k, d in zip(hidden_dims, context_sizes, dilations):
+        in_channels = input_dim
+        for out_ch, k, d in zip(conv_channels, context_sizes, dilations):
             conv = nn.Conv1d(
                 in_channels=in_channels,
-                out_channels=hdim,
+                out_channels=out_ch,
                 kernel_size=k,
                 dilation=d,
-                padding=0  # manual left padding → causal
+                padding=0  # manual causal padding
             )
             self.tdnn_layers.append(conv)
-            in_channels = hdim
+            in_channels = out_ch
 
-        self.output_layer = nn.Linear(in_channels, output_dim)
+        # flatten after keeping full window
+        self.window = window
+        flattened_dim = in_channels * window
+
+        # -------- Fully-connected (MLP) stack --------
+        self.fc_layers = nn.ModuleList()
+        in_features = flattened_dim
+        for h in fc_dims:
+            self.fc_layers.append(nn.Linear(in_features, h))
+            in_features = h
+
+        self.output_layer = nn.Linear(in_features, output_dim)
 
     def forward(self, x):
         """
         x: (batch, time, feat)
         """
-        # (B, T, F) -> (B, F, T)
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2)  # (B, F, T)
 
+        # TDNN conv
         for conv, k, d in zip(self.tdnn_layers, self.kernel_sizes, self.dilations):
             pad_left = (k - 1) * d
-            # F.pad pads (left, right) along the last dimension (time)
-            x = F.pad(x, (pad_left, 0))   # causal: only pad on the left
+            x = F.pad(x, (pad_left, 0))
             x = F.relu(conv(x))
 
-        # Global mean pooling over time
-        x = x.mean(dim=2)  # (B, C)
+        # Flatten (B, C*T)
+        x = x.reshape(x.size(0), -1)
+
+        # Dense layers
+        for fc in self.fc_layers:
+            x = F.relu(fc(x))
 
         return self.output_layer(x)
 
@@ -107,7 +125,7 @@ def load_error_files(folder):
                     "vx_sgp4","vy_sgp4","vz_sgp4",
                     "err_x","err_y","err_z"}
         if not required.issubset(df.columns):
-            raise ValueError(f"Missing columns in {f}")
+            raise ValueError(f"Missing columns in " + f)
 
         all_dfs.append(df.reset_index(drop=True))
 
@@ -115,9 +133,10 @@ def load_error_files(folder):
 
 
 # ==============================================================
-# FILE-BASED TRAIN/TEST SPLIT
+# FILE SPLIT
 # ==============================================================
 def split_by_file(datasets, files, test_fraction=0.2):
+     
     N = len(datasets)
     test_count = max(1, int(N * test_fraction))
 
@@ -137,27 +156,25 @@ def split_by_file(datasets, files, test_fraction=0.2):
 
 
 # ==============================================================
-# BUILD WINDOWED DATASET
+# WINDOW BUILDER: Uses SGP4 + residual history + Δ residual
 # ==============================================================
 def build_windowed_dataset(datasets, window, scaler=None):
     df_all = pd.concat(datasets, ignore_index=True)
 
-    # Extract truth residuals in METERS
+    # ------------ TARGET: truth residual (label) ------------
     residual = df_all[["err_x","err_y","err_z"]].values.astype(np.float32)
 
     # Δ residual
     dres = np.diff(residual, axis=0, prepend=residual[0:1])
 
-    # SGP4 state
+    # ------------ SGP4 INPUT (state only) ------------
     if USE_VELOCITY:
         sgp4 = df_all[["x_sgp4","y_sgp4","z_sgp4",
                        "vx_sgp4","vy_sgp4","vz_sgp4"]].values.astype(np.float32)
     else:
         sgp4 = df_all[["x_sgp4","y_sgp4","z_sgp4"]].values.astype(np.float32)
 
-    # ----------------------------
-    # NORMALIZE INPUTS (sgp4 only)
-    # ----------------------------
+    # Normalize SGP4
     if scaler is None:
         mean = sgp4.mean(axis=0)
         std  = sgp4.std(axis=0)
@@ -166,42 +183,37 @@ def build_windowed_dataset(datasets, window, scaler=None):
 
     sgp4_norm = (sgp4 - scaler["mean"]) / scaler["std"]
 
-    # --------------------------------
-    # WINDOW BUILDING LOOP
-    # --------------------------------
-    X_list = []
-    y_list = []
+    # ------------ Build Windows ------------
+    X_list, y_list = [], []
 
     for i in range(window, len(df_all)):
-        # windowed features
         w_res  = residual[i-window:i]        # (window,3)
         w_dres = dres[i-window:i]            # (window,3)
         w_sgp4 = sgp4_norm[i-window:i]       # (window,6 or 3)
 
-        # CONCAT: residual + Δresidual + sgp4
-        w = np.concatenate([w_res, w_dres, w_sgp4], axis=1)   # (window, feat_dim)
+        # CONCAT features
+        # residual + dResidual + SGP4
+        w = np.concatenate([w_res, w_dres, w_sgp4], axis=1)
 
         X_list.append(w)
-        y_list.append(residual[i])  # target is raw residual in meters
+        y_list.append(residual[i])           # predict next residual
 
-    X = np.array(X_list, dtype=np.float32)         # (N, window, feat_dim)
-    y = np.array(y_list, dtype=np.float32)         # (N, 3)
+    X = np.array(X_list, dtype=np.float32)   # (N, window, feat_dim_total)
+    y = np.array(y_list, dtype=np.float32)   # (N, 3)
 
-    print(f"Built windowed dataset: {len(X)} samples, window={window}, feat_dim={X.shape[2]}")
+    print(f"Dataset: {len(X)} samples | window={window} | feat_dim={X.shape[2]}")
     return X, y, scaler
 
 
 # ==============================================================
-# TRAINING LOOP
+# TRAINING
 # ==============================================================
 def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
     criterion = nn.MSELoss()
     optimiz = optim.Adam(model.parameters(), lr=lr)
-
     train_loss, val_loss = [], []
 
     for ep in range(epochs):
-        # ---------------- TRAIN ----------------
         model.train()
         total = 0
         for xb, yb in train_loader:
@@ -213,188 +225,110 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
             total += loss.item()
         tr = total / len(train_loader)
 
-        # ---------------- VAL ----------------
         model.eval()
         total = 0
         with torch.no_grad():
             for xb, yb in val_loader:
-                pred = model(xb)
-                loss = criterion(pred, yb)
+                loss = criterion(model(xb), yb)
                 total += loss.item()
         vl = total / len(val_loader)
 
         train_loss.append(tr)
         val_loss.append(vl)
-
-        print(f"Epoch {ep+1:3d}/{epochs}: Train={tr:.5f}  Val={vl:.5f}")
+        print(f"Epoch {ep+1:3d}/{epochs}: Train={tr:.6f}  Val={vl:.6f}")
 
     return train_loss, val_loss
 
 
 # ==============================================================
-# MAIN
+# MAIN EXECUTION
 # ==============================================================
 if __name__ == "__main__":
 
-    # --------------------------
-    # LOAD & SPLIT
-    # --------------------------
     datasets, files = load_error_files(ERROR_PATH)
-    train_sets, test_sets = split_by_file(datasets, files,.01)
+    train_sets, test_sets = split_by_file(datasets, files, 0.2)
 
-    # --------------------------
-    # BUILD TRAIN+VAL
-    # --------------------------
     X_all, y_all, scaler = build_windowed_dataset(train_sets, WINDOW)
-    # X_all: (N, window, feat_dim)
 
+    # Split train/validation
     N = len(X_all)
     idx_val = int(0.85 * N)
+    X_train, y_train = X_all[:idx_val], y_all[:idx_val]
+    X_val,   y_val   = X_all[idx_val:], y_all[idx_val:]
 
-    X_train = X_all[:idx_val]
-    y_train = y_all[:idx_val]
-    X_val   = X_all[idx_val:]
-    y_val   = y_all[idx_val:]
+    # Loaders
+    train_loader = DataLoader(TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
+                              batch_size=BATCH_SIZE, shuffle=True)
+    val_loader   = DataLoader(TensorDataset(torch.tensor(X_val), torch.tensor(y_val)),
+                              batch_size=BATCH_SIZE, shuffle=False)
 
-    # torch loaders
-    train_loader = DataLoader(
-        TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
-        batch_size=BATCH_SIZE, shuffle=True
-    )
+    feat_dim = X_all.shape[2]    # includes residual+Δres+SGP4
 
-    val_loader = DataLoader(
-        TensorDataset(torch.tensor(X_val), torch.tensor(y_val)),
-        batch_size=BATCH_SIZE, shuffle=False
-    )
+    model = TDNN(input_dim=feat_dim, window=WINDOW,
+                conv_channels=(5, 5),
+                context_sizes=(5, 3),
+                dilations=(1, 2),
+                fc_dims=(64, 64),
+                output_dim=3)
 
+    # ---------------- Train OR Load Model ----------------
     if not os.path.exists(MODEL_PATH):
-        
-        print(f"\nTraining new model (will be saved to {MODEL_PATH})")
 
-        # feat_dim per time step
-        feat_dim = X_all.shape[2]   # (N, window, feat_dim)
-        model = TDNN(
-            input_dim=feat_dim,
-            hidden_dims=([256]),
-            context_sizes=([5]),
-            dilations=([1]),
-            output_dim=3
-        )
-
-        # --------------------------
-        # TRAIN
-        # --------------------------
         train_curve, val_curve = train_model(model, train_loader, val_loader,
-                                            epochs=EPOCHS, lr=LR)
-
+                                             epochs=EPOCHS, lr=LR)
 
         if SAVE_MODEL:
             torch.save(model.state_dict(), MODEL_PATH)
-            print("\nSaved model →", MODEL_PATH)
 
-        # save loss curves
         pd.DataFrame({"train":train_curve,"val":val_curve}).to_csv(LOSS_CSV, index=False)
 
-        # TRAINING & VALIDATION LOSS
+        # Plot training loss
         plt.figure(figsize=(10,5))
-        plt.plot(train_curve, label="Train Loss")
-        plt.plot(val_curve, label="Val Loss")
-        plt.title("TDNN Training Loss (Residual Prediction)")
-        plt.xlabel("Epoch")
-        plt.ylabel("MSE (m^2)")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
+        plt.plot(train_curve, label="Train")
+        plt.plot(val_curve, label="Val")
+        plt.title("TDNN Training Loss (Residual + ΔResidual + SGP4)")
+        plt.xlabel("Epoch"); plt.ylabel("MSE (m^2)")
+        plt.grid(); plt.legend(); plt.tight_layout()
         plt.show(block=False)
 
-        # plt.figure()
-        # plt.plot(train_curve, label="Train")
-        # plt.plot(val_curve, label="Val")
-        # plt.title("TDNN Training (Residual from History)")
-        # plt.grid(True)
-        # plt.legend()
-        # plt.show(block=False)
     else:
-
-        print(f"\nLoading existing model from {MODEL_PATH}")
-        feat_dim = X_all.shape[2]   # (N, window, feat_dim)
-        model = TDNN(
-            input_dim=feat_dim,
-            hidden_dims=([256]),
-            context_sizes=([5]),
-            dilations=([1]),
-            output_dim=3
-        )
+        
         model.load_state_dict(torch.load(MODEL_PATH))
+        model.eval()
+        print("\nLoaded saved model.\n")
 
-        # load loss curves
-        # loss_df = pd.read_csv(LOSS_CSV)
-        # train_curve = loss_df["train"].values
-        # val_curve   = loss_df["val"].values
-
-    # --------------------------
-    # TEST SET 
-    # --------------------------
-   
+    # ---------------- TEST ----------------
     X_test, y_test, _ = build_windowed_dataset(test_sets, WINDOW, scaler)
-    # X_test: (N_test, window, feat_dim)
 
-    # Optionally limit test size
-    # if TEST_SAMPLES is not None:
-    #     N_test = len(X_test)
-    #     M = min(TEST_SAMPLES, N_test)
-    #     print(f"Using only the first {M} windowed test samples out of {N_test}")
-    #     X_test = X_test[:M]
-    #     y_test = y_test[:M]
+    if TEST_SAMPLES is not None:
+        M = min(TEST_SAMPLES, len(X_test))
+        X_test, y_test = X_test[:M], y_test[:M]
 
-    model.eval()
     with torch.no_grad():
-        y_pred = model(torch.tensor(X_test)).numpy()   # <<< CHANGED (no flatten)
+        y_pred = model(torch.tensor(X_test)).numpy()
 
-    # ---------------------------------------
-    # COMPUTE CORRECTED ORBITS (DENORMALIZED)
-    # ---------------------------------------
+    # Compute corrected positions
     df_test = pd.concat(test_sets, ignore_index=True)
-
-    # raw SGP4 positions
     sgp4_pos = df_test[["x_sgp4","y_sgp4","z_sgp4"]].values.astype(np.float32)
+    sgp4_pos = sgp4_pos[WINDOW:len(X_test)+WINDOW]
 
-    # if TEST_SAMPLES is not None:
-    #     sgp4_pos = sgp4_pos[:len(y_test)]
-
-    # align lengths: remove first WINDOW rows
-    sgp4_pos = sgp4_pos[WINDOW:]
-
-    # truth pos = sgp4 + true residual
-    truth_pos = sgp4_pos + y_test
-
-    # corrected pos = sgp4 + predicted residual
-    corrected_pos = sgp4_pos + y_pred   # y_pred is in METERS (correct)
+    truth_pos     = sgp4_pos + y_test
+    corrected_pos = sgp4_pos + y_pred
 
     sgp4_err = np.linalg.norm(truth_pos - sgp4_pos, axis=1)
     tdnn_err = np.linalg.norm(truth_pos - corrected_pos, axis=1)
 
-    plt.figure(figsize=(14,5))
-    plt.plot(sgp4_err, alpha=0.6, label="SGP4 Error")
-    plt.plot(tdnn_err, alpha=0.6, label="TDNN Corrected Error")
-    plt.title("SGP4 vs TDNN-Corrected 3D Error ")
-    plt.ylabel("3D Error (m)")
-    plt.legend()
-    plt.grid(True)
-    plt.show(block=False)
-
-    # RMS comparison
+    # RMS improvement
     sgp4_rms = np.sqrt(np.mean(sgp4_err**2))
     tdnn_rms = np.sqrt(np.mean(tdnn_err**2))
-    improvement = 100*(sgp4_rms-tdnn_rms)/sgp4_rms
 
-    print("\n===== RMS Error Comparison =====")
+    print("\n===== RMS Error =====")
     print(f"SGP4 RMS   : {sgp4_rms:.3f} m")
     print(f"TDNN RMS   : {tdnn_rms:.3f} m")
-    print(f"Improvement: {improvement:+.2f}%")
-    print("================================")
+    print(f"Improvement: {(100*(sgp4_rms-tdnn_rms)/sgp4_rms):+.2f}%")
+    print("======================")
 
-    # save predictions
+    # Save predictions
     pd.DataFrame({
         "sgp4_err": sgp4_err,
         "tdnn_err": tdnn_err,
@@ -406,9 +340,8 @@ if __name__ == "__main__":
         "pred_z": y_pred[:,2],
     }).to_csv(PRED_CSV, index=False)
 
-    # ==============================================================
-    # PLOTTING SECTION
-    # ==============================================================
+    print("\nSaved predictions →", PRED_CSV)
+
     print("\n=== Generating Plots ===")
 
 
@@ -417,7 +350,7 @@ if __name__ == "__main__":
     pred_norm = np.linalg.norm(y_pred, axis=1)
 
     plt.figure(figsize=(14,5))
-    plt.plot(true_norm, label="True Residual |SP3 − SGP4|", alpha=0.8)
+    plt.plot(true_norm, label="True Residual |SP3 - SGP4|", alpha=0.8)
     plt.plot(pred_norm, label="Predicted Residual", alpha=0.8)
     plt.title("TDNN Residual Prediction on Held-Out Files")
     plt.xlabel("Sample")
@@ -431,7 +364,7 @@ if __name__ == "__main__":
     plt.figure(figsize=(14,5))
     plt.plot(sgp4_err, label="SGP4 Error", alpha=0.6)
     plt.plot(tdnn_err, label="TDNN-Corrected Error", alpha=0.6)
-    plt.title("SGP4 vs TDNN-Corrected 3D Error (Held-Out Files)")
+    plt.title("SGP4 vs TDNN-Corrected 3D Error")
     plt.xlabel("Sample")
     plt.ylabel("3D Error (m)")
     plt.grid(True)
@@ -459,7 +392,7 @@ if __name__ == "__main__":
     plt.figure(figsize=(8,5))
     plt.hist(sgp4_err, bins=80, alpha=0.5, label="SGP4 Error")
     plt.hist(tdnn_err, bins=80, alpha=0.5, label="TDNN Error")
-    plt.title("Distribution of 3D Errors (Held-Out Files)")
+    plt.title("Distribution of 3D Errors")
     plt.xlabel("3D Error (m)")
     plt.ylabel("Count")
     plt.legend()
@@ -486,6 +419,7 @@ if __name__ == "__main__":
     plt.show(block=False)
 
     print("=== Plotting Complete ===\n")
+    
 
-    print("\nSaved predictions →", PRED_CSV)
-    input("Press ENTER to close plots...")
+
+    input("\nPress ENTER to exit...")
