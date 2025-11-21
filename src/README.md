@@ -1,20 +1,25 @@
 # TDNN-Based SGP4 Residual Correction - README
+### COMP 6600 Final Project by Oren Miller and Luke Zins
 
 This project implements a Time-Delay Neural Network (TDNN) that learns to
 predict orbit residuals (position error) from SGP4 state history, residual history,
-and Δ-residual history. The network statistically corrects SGP4 by predicting
+and delta-residual history. The network statistically corrects SGP4 by predicting
 the next residual in ECEF meters and adding it to the SGP4-estimated position.
 
 ## PROJECT STRUCTURE
+```
 project/
 |
-+-- data/                Input data
-+-- requirements.txt     Code Dependencies
-+-- main.py              Full TDNN training + testing script
++-- data/                Input data - SGP4 Errors and SP3 Truth for LAGEOS-1,
++-- save/                Saved Data
+    |
+    +--csv/              Saved Training/Validation Loss CSVs
+    +--models/           Saved Pytorch Model Weights
+    +--plots/            Testing and Training Plots
++-- main.py              Full TDNN training and testing script
 +-- README.txt           This file
-+-- models/              Saved models may be stored here
-+-- plots/
-
++-- requirements.txt     Code Dependencies
+```
 ## MODEL SUMMARY
 The TDNN receives a sliding history window (example: 180 samples) where each time
 step contains:
@@ -37,13 +42,19 @@ Corrected Position = SGP4 Output + Predicted Residual
 ## INPUT DATA REQUIREMENTS
 The /data/ folder must contain one or more files with the following text format:
 
-time  x_sgp4  y_sgp4  z_sgp4  vx_sgp4  vy_sgp4  vz_sgp4  err_x  err_y  err_z
+```
+time  x_sgp4  y_sgp4  z_sgp4  vx_sgp4  vy_sgp4  vz_sgp4 err_x  err_y  err_z
+```
 
 ## INSTALLATION
+```
 pip install -r requirements.txt
+```
 
 ## RUNNING THE MODEL
+```
 python main.py
+```
 
 If no saved model exists, a new one will be trained.
 If a model already exists, training is skipped and testing is run immediately.

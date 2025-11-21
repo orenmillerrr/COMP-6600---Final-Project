@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 # ==============================================================
 # CONFIGURATION
 # ==============================================================
-
 PATH = os.getcwd()
 WINDOW = 180
 USE_VELOCITY = True   # turn ON/OFF velocity features
@@ -21,23 +20,23 @@ EPOCHS = 100
 LR = 0.0001
 
 ERROR_PATH = PATH + "\\data"
-MODEL_PATH = PATH + "\\tdnn_model.pth"
-LOSS_CSV   = PATH + "\\tdnn_loss_curves.csv"
-PRED_CSV   = PATH + "\\tdnn_predictions.csv"
+MODEL_PATH = PATH + "\\save\\models\\tdnn_model.pth"
+LOSS_CSV   = PATH + "\\save\\csv\\tdnn_loss_curves.csv"
+PRED_CSV   = PATH + "\\save\\csv\\tdnn_predictions.csv"
 
 SAVE_MODEL   = True          # set True if you want to save the trained model
 TEST_SAMPLES = 10000           # None = use all test windows, or set e.g. 5000
 
 
 # ==============================================================
-# TDNN (Conv → Flatten → Dense MLP)
+# TDNN (Conv ->Flatten -> Dense MLP)
 # ==============================================================
 
 class TDNN(nn.Module):
     """
     TDNN:
-      - stack of 1D convs over time (causal)
-      - flatten (time × channels)
+      - stack of 1D convs over time
+      - flatten (time x channels)
       - dense MLP stack
     
     Input:  (batch, time, feat)   -> residual, dResidual, SGP4 state
@@ -50,7 +49,7 @@ class TDNN(nn.Module):
         conv_channels=(5, 5),    # out_channels for each conv layer
         context_sizes=(5, 3),    # kernel sizes
         dilations=(1, 2),        # dilations
-        fc_dims=(64, 64),      # hidden sizes for dense layers
+        fc_dims=(64, 64),        # hidden sizes for dense layers
         output_dim: int = 3      # final output dim (x,y,z residual)
     ):
         super().__init__()
@@ -70,12 +69,11 @@ class TDNN(nn.Module):
                 out_channels=out_ch,
                 kernel_size=k,
                 dilation=d,
-                padding=0  # manual causal padding
+                padding=0 
             )
             self.tdnn_layers.append(conv)
             in_channels = out_ch
 
-        # flatten after keeping full window
         self.window = window
         flattened_dim = in_channels * window
 
@@ -92,7 +90,7 @@ class TDNN(nn.Module):
         """
         x: (batch, time, feat)
         """
-        x = x.transpose(1, 2)  # (B, F, T)
+        x = x.transpose(1, 2)
 
         # TDNN conv
         for conv, k, d in zip(self.tdnn_layers, self.kernel_sizes, self.dilations):
@@ -100,7 +98,7 @@ class TDNN(nn.Module):
             x = F.pad(x, (pad_left, 0))
             x = F.relu(conv(x))
 
-        # Flatten (B, C*T)
+        # Flatten
         x = x.reshape(x.size(0), -1)
 
         # Dense layers
@@ -156,18 +154,18 @@ def split_by_file(datasets, files, test_fraction=0.2):
 
 
 # ==============================================================
-# WINDOW BUILDER: Uses SGP4 + residual history + Δ residual
+# WINDOW BUILDER: Uses SGP4 + residual history + dresidual
 # ==============================================================
 def build_windowed_dataset(datasets, window, scaler=None):
     df_all = pd.concat(datasets, ignore_index=True)
 
-    # ------------ TARGET: truth residual (label) ------------
+    # ------------ TARGET: truth residual ------------
     residual = df_all[["err_x","err_y","err_z"]].values.astype(np.float32)
 
-    # Δ residual
+    # dresidual
     dres = np.diff(residual, axis=0, prepend=residual[0:1])
 
-    # ------------ SGP4 INPUT (state only) ------------
+    # ------------ SGP4 INPUT ------------
     if USE_VELOCITY:
         sgp4 = df_all[["x_sgp4","y_sgp4","z_sgp4",
                        "vx_sgp4","vy_sgp4","vz_sgp4"]].values.astype(np.float32)
@@ -187,19 +185,18 @@ def build_windowed_dataset(datasets, window, scaler=None):
     X_list, y_list = [], []
 
     for i in range(window, len(df_all)):
-        w_res  = residual[i-window:i]        # (window,3)
-        w_dres = dres[i-window:i]            # (window,3)
-        w_sgp4 = sgp4_norm[i-window:i]       # (window,6 or 3)
+        w_res  = residual[i-window:i]      
+        w_dres = dres[i-window:i]       
+        w_sgp4 = sgp4_norm[i-window:i]   
 
-        # CONCAT features
         # residual + dResidual + SGP4
         w = np.concatenate([w_res, w_dres, w_sgp4], axis=1)
 
         X_list.append(w)
-        y_list.append(residual[i])           # predict next residual
+        y_list.append(residual[i])    
 
-    X = np.array(X_list, dtype=np.float32)   # (N, window, feat_dim_total)
-    y = np.array(y_list, dtype=np.float32)   # (N, 3)
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.float32)
 
     print(f"Dataset: {len(X)} samples | window={window} | feat_dim={X.shape[2]}")
     return X, y, scaler
@@ -239,6 +236,16 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
 
     return train_loss, val_loss
 
+def add_noise_to_raw_residuals(datasets, noise_mean=0.0, noise_std=0.0):
+    noisy_sets = []
+    for df in datasets:
+        df = df.copy()
+        if noise_std > 0:
+            df[["err_x", "err_y", "err_z"]] += np.random.normal(
+                noise_mean, noise_std, df[["err_x", "err_y", "err_z"]].shape
+            )
+        noisy_sets.append(df)
+    return noisy_sets
 
 # ==============================================================
 # MAIN EXECUTION
@@ -262,7 +269,7 @@ if __name__ == "__main__":
     val_loader   = DataLoader(TensorDataset(torch.tensor(X_val), torch.tensor(y_val)),
                               batch_size=BATCH_SIZE, shuffle=False)
 
-    feat_dim = X_all.shape[2]    # includes residual+Δres+SGP4
+    feat_dim = X_all.shape[2]
 
     model = TDNN(input_dim=feat_dim, window=WINDOW,
                 conv_channels=(5, 5),
@@ -286,7 +293,7 @@ if __name__ == "__main__":
         plt.figure(figsize=(10,5))
         plt.plot(train_curve, label="Train")
         plt.plot(val_curve, label="Val")
-        plt.title("TDNN Training Loss (Residual + ΔResidual + SGP4)")
+        plt.title("TDNN Training Loss (Residual + dResidual + SGP4)")
         plt.xlabel("Epoch"); plt.ylabel("MSE (m^2)")
         plt.grid(); plt.legend(); plt.tight_layout()
         plt.show(block=False)
@@ -298,6 +305,8 @@ if __name__ == "__main__":
         print("\nLoaded saved model.\n")
 
     # ---------------- TEST ----------------
+    test_sets = add_noise_to_raw_residuals(test_sets, noise_mean=0.0, noise_std=10.0)
+
     X_test, y_test, _ = build_windowed_dataset(test_sets, WINDOW, scaler)
 
     if TEST_SAMPLES is not None:
@@ -344,8 +353,7 @@ if __name__ == "__main__":
 
     print("\n=== Generating Plots ===")
 
-
-    # 2 — TRUE vs PREDICTED RESIDUAL MAGNITUDE
+    # TRUE vs PREDICTED RESIDUAL MAGNITUDE
     true_norm = np.linalg.norm(y_test, axis=1)
     pred_norm = np.linalg.norm(y_pred, axis=1)
 
@@ -360,7 +368,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show(block=False)
 
-    # 3 — SGP4 vs TDNN-CORRECTED POSITION ERROR
+    # SGP4 vs TDNN-CORRECTED POSITION ERROR
     plt.figure(figsize=(14,5))
     plt.plot(sgp4_err, label="SGP4 Error", alpha=0.6)
     plt.plot(tdnn_err, label="TDNN-Corrected Error", alpha=0.6)
@@ -372,7 +380,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show(block=False)
 
-    # 4 — COMPONENT-WISE RESIDUAL PREDICTION
+    # COMPONENT-WISE RESIDUAL PREDICTION
     fig, axs = plt.subplots(3, 1, figsize=(14,12), sharex=True)
 
     labels = ["X Residual (m)", "Y Residual (m)", "Z Residual (m)"]
@@ -388,7 +396,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show(block=False)
 
-    # 5 — ERROR HISTOGRAM COMPARISON
+    # ERROR HISTOGRAM COMPARISON
     plt.figure(figsize=(8,5))
     plt.hist(sgp4_err, bins=80, alpha=0.5, label="SGP4 Error")
     plt.hist(tdnn_err, bins=80, alpha=0.5, label="TDNN Error")
@@ -400,7 +408,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show(block=False)
 
-    # 6 — SCATTER OF TRUE vs PREDICTED RESIDUAL COMPONENTS
+    # SCATTER OF TRUE vs PREDICTED RESIDUAL COMPONENTS
     fig, axs = plt.subplots(1, 3, figsize=(17,5))
 
     c_titles = ["X Component", "Y Component", "Z Component"]
@@ -419,7 +427,5 @@ if __name__ == "__main__":
     plt.show(block=False)
 
     print("=== Plotting Complete ===\n")
-    
-
 
     input("\nPress ENTER to exit...")
