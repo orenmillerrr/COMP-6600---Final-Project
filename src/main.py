@@ -360,7 +360,7 @@ if __name__ == "__main__":
     plt.figure(figsize=(14,5))
     plt.plot(true_norm, label="True Residual |SP3 - SGP4|", alpha=0.8)
     plt.plot(pred_norm, label="Predicted Residual", alpha=0.8)
-    plt.title("TDNN Residual Prediction on Held-Out Files")
+    plt.title("TDNN Residual Prediction")
     plt.xlabel("Sample")
     plt.ylabel("3D Residual (m)")
     plt.grid(True)
